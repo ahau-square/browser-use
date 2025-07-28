@@ -65,6 +65,7 @@ class BrowserStateSummary(DOMState):
 	pixels_below: int = 0
 	browser_errors: list[str] = field(default_factory=list)
 	is_pdf_viewer: bool = False  # Whether the current page is a PDF viewer
+	console_logs: list[dict[str, Any]] = field(default_factory=list)
 
 
 @dataclass

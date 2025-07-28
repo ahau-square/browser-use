@@ -294,6 +294,7 @@ class BrowserSession(BaseModel):
 	_downloaded_files: list[str] = PrivateAttr(default_factory=list)
 	_original_browser_session: Any = PrivateAttr(default=None)  # Reference to prevent GC of the original session when copied
 	_owns_browser_resources: bool = PrivateAttr(default=True)  # True if this instance owns and should clean up browser resources
+	_current_console_logs: list[dict[str, Any]] = PrivateAttr(default_factory=list)
 	_auto_download_pdfs: bool = PrivateAttr(default=True)  # Auto-download PDFs when detected
 	_subprocess: Any = PrivateAttr(default=None)  # Chrome subprocess reference for error handling
 
@@ -601,6 +602,99 @@ class BrowserSession(BaseModel):
 			except TimeoutError:
 				# Never let __del__ raise Timeout exceptions
 				pass
+
+	def _on_console_message(self, msg):
+		"""Handle console messages from the browser."""
+		import time
+		
+		console_entry = {
+			'type': msg.type,  # 'log', 'error', 'warn', 'info', etc.
+			'text': msg.text,
+			'timestamp': time.time(),
+			'location': getattr(msg.location, 'url', None) if msg.location else None
+		}
+		
+		# Store in current console logs (limit to last 1000 entries)
+		self._current_console_logs.append(console_entry)
+		if len(self._current_console_logs) > 1000:
+			self._current_console_logs.pop(0)
+
+	def _on_page_error(self, error):
+		"""Handle page errors."""
+		import time
+		
+		error_entry = {
+			'type': 'pageerror',
+			'text': str(error),
+			'timestamp': time.time()
+		}
+		
+		# Store in current console logs (limit to last 1000 entries)
+		self._current_console_logs.append(error_entry)
+		if len(self._current_console_logs) > 1000:
+			self._current_console_logs.pop(0)
+
+	def _on_request_failed(self, request):
+		"""Handle failed network requests."""
+		import time
+		
+		error_entry = {
+			'type': 'network_error',
+			'text': f'Failed to load resource: {request.url} - {request.failure}',
+			'timestamp': time.time(),
+			'location': request.url
+		}
+		
+		# Store in current console logs (limit to last 1000 entries)
+		self._current_console_logs.append(error_entry)
+		if len(self._current_console_logs) > 1000:
+			self._current_console_logs.pop(0)
+
+	def _on_page_crash(self, page):
+		"""Handle page crashes."""
+		import time
+		
+		error_entry = {
+			'type': 'crash',
+			'text': f'Page crashed: {page.url}',
+			'timestamp': time.time(),
+			'location': page.url
+		}
+		
+		# Store in current console logs (limit to last 1000 entries)
+		self._current_console_logs.append(error_entry)
+		if len(self._current_console_logs) > 1000:
+			self._current_console_logs.pop(0)
+
+	def _on_response_error(self, response):
+		"""Handle HTTP response errors (4xx, 5xx status codes)."""
+		import time
+		
+		# Only log errors for non-success status codes
+		if response.status >= 400:
+			error_entry = {
+				'type': 'http_error',
+				'text': f'HTTP {response.status} {response.status_text}: {response.url}',
+				'timestamp': time.time(),
+				'location': response.url
+			}
+			
+			# Store in current console logs (limit to last 1000 entries)
+			self._current_console_logs.append(error_entry)
+			if len(self._current_console_logs) > 1000:
+				self._current_console_logs.pop(0)
+
+	def _setup_page_console_listeners(self, page):
+		"""Set up console and error listeners for a page."""
+		try:
+			# Add console listeners (playwright will handle duplicates)
+			page.on('console', self._on_console_message)
+			page.on('pageerror', self._on_page_error)
+			page.on('requestfailed', self._on_request_failed)
+			page.on('response', self._on_response_error)
+			page.on('crash', self._on_page_crash)
+		except Exception as e:
+			self.logger.debug(f'Failed to set up console listeners: {e}')
 
 	def _kill_child_processes(self, _hint: str = '') -> None:
 		"""Kill any child processes that might be related to the browser"""
@@ -1724,6 +1818,8 @@ class BrowserSession(BaseModel):
 				# Create new page directly to avoid using decorated methods
 				new_page = await self.browser_context.new_page()
 				self.agent_current_page = new_page
+				# Set up console listeners for the new page
+				self._setup_page_console_listeners(new_page)
 				if (not self.human_current_page) or self.human_current_page.is_closed():
 					self.human_current_page = new_page
 				# Test the new tab
@@ -2282,6 +2378,9 @@ class BrowserSession(BaseModel):
 			assert self.browser_context is not None, 'Browser context is not set'
 			self.agent_current_page = await self.browser_context.new_page()
 
+			# Set up console listeners for the new page
+			self._setup_page_console_listeners(self.agent_current_page)
+
 			# Update human tab reference if there is no human tab yet
 			if (not self.human_current_page) or self.human_current_page.is_closed():
 				self.human_current_page = self.agent_current_page
@@ -2783,6 +2882,8 @@ class BrowserSession(BaseModel):
 		# Attach event listeners
 		page.on('request', on_request)
 		page.on('response', on_response)
+		page.on('console', self._on_console_message)
+		page.on('pageerror', self._on_page_error)
 
 		now = asyncio.get_event_loop().time()
 		try:
@@ -3181,6 +3282,7 @@ class BrowserSession(BaseModel):
 			pixels_below=0,
 			browser_errors=[f'Page state retrieval failed, minimal recovery applied for {url}'],
 			is_pdf_viewer=is_pdf_viewer,
+			console_logs=self._current_console_logs.copy(),
 		)
 
 	@observe_debug(ignore_input=True, ignore_output=True, name='get_updated_state')
@@ -3313,6 +3415,7 @@ class BrowserSession(BaseModel):
 				pixels_below=pixels_below,
 				browser_errors=browser_errors,
 				is_pdf_viewer=is_pdf_viewer,
+				console_logs=self._current_console_logs.copy(),
 			)
 
 			self.logger.debug('✅ get_state_summary completed successfully')

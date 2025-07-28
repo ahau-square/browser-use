@@ -254,6 +254,11 @@ class BrowserUseServer:
 								'type': 'boolean',
 								'description': 'Whether to include a screenshot of the current page',
 								'default': False,
+							},
+							'include_console_logs': {
+								'type': 'boolean',
+								'description': 'Whether to include JavaScript console logs and errors',
+								'default': False,
 							}
 						},
 					},
@@ -362,13 +367,27 @@ class BrowserUseServer:
 			]
 
 		@self.server.call_tool()
-		async def handle_call_tool(name: str, arguments: dict[str, Any] | None) -> list[types.TextContent]:
+		async def handle_call_tool(name: str, arguments: dict[str, Any] | None) -> list[types.Content]:
 			"""Handle tool execution."""
 			start_time = time.time()
 			error_msg = None
 			try:
 				result = await self._execute_tool(name, arguments or {})
-				return [types.TextContent(type='text', text=result)]
+				if isinstance(result, dict) and 'text' in result and 'screenshot' in result:
+					# Handle browser_get_state with screenshot
+					text_content = result.get('text', '')
+					screenshot_data = result.get('screenshot')
+					content_blocks: list[types.Content] = [types.TextContent(type='text', text=text_content)]
+					if screenshot_data:
+						content_blocks.append(types.ImageContent(
+							type='image',
+							data=screenshot_data,
+							mimeType='image/png'
+						))
+					return content_blocks
+				else:
+					# Handle regular text responses
+					return [types.TextContent(type='text', text=str(result))]
 			except Exception as e:
 				error_msg = str(e)
 				logger.error(f'Tool execution failed: {e}', exc_info=True)
@@ -386,7 +405,7 @@ class BrowserUseServer:
 					)
 				)
 
-	async def _execute_tool(self, tool_name: str, arguments: dict[str, Any]) -> str:
+	async def _execute_tool(self, tool_name: str, arguments: dict[str, Any]) -> str | dict[str, Any]:
 		"""Execute a browser-use tool."""
 
 		# Agent-based tools
@@ -415,7 +434,11 @@ class BrowserUseServer:
 				return await self._type_text(arguments['index'], arguments['text'])
 
 			elif tool_name == 'browser_get_state':
-				return await self._get_browser_state(arguments.get('include_screenshot', False))
+				browser_state_result = await self._get_browser_state(
+					arguments.get('include_screenshot', False),
+					arguments.get('include_console_logs', False)
+				)
+				return browser_state_result
 
 			elif tool_name == 'browser_extract_content':
 				return await self._extract_content(arguments['query'], arguments.get('extract_links', False))
@@ -480,6 +503,11 @@ class BrowserUseServer:
 		# Create browser session
 		self.browser_session = BrowserSession(browser_profile=profile)
 		await self.browser_session.start()
+
+		# Set up console listeners for any existing pages
+		if self.browser_session.browser_context:
+			for page in self.browser_session.browser_context.pages:
+				self.browser_session._setup_page_console_listeners(page)
 
 		# Create controller for direct actions
 		self.controller = Controller()
@@ -654,7 +682,7 @@ class BrowserUseServer:
 		await self.browser_session._input_text_element_node(element, text)
 		return f"Typed '{text}' into element {index}"
 
-	async def _get_browser_state(self, include_screenshot: bool = False) -> str:
+	async def _get_browser_state(self, include_screenshot: bool = False, include_console_logs: bool = False) -> str | dict[str, Any]:
 		"""Get current browser state."""
 		if not self.browser_session:
 			return 'Error: No browser session active'
@@ -681,10 +709,17 @@ class BrowserUseServer:
 				elem_info['href'] = element.attributes['href']
 			result['interactive_elements'].append(elem_info)
 
-		if include_screenshot and state.screenshot:
-			result['screenshot'] = state.screenshot
+		if include_console_logs and state.console_logs:
+			result['console_logs'] = state.console_logs
 
-		return json.dumps(result, indent=2)
+		# If screenshot is requested, return a dict with separate text and screenshot
+		if include_screenshot:
+			return {
+				'text': json.dumps(result, indent=2),
+				'screenshot': state.screenshot
+			}
+		else:
+			return json.dumps(result, indent=2)
 
 	async def _extract_content(self, query: str, extract_links: bool = False) -> str:
 		"""Extract content from current page."""
